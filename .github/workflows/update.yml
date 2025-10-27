@@ -4,7 +4,7 @@ on:
   workflow_dispatch: {}
   schedule:
     # 每个工作日 10:30 UTC 运行一次（可按需调整）
-    - cron: "30 10 * * 1-5"
+    - cron: "30 17 * * *"
 
 permissions:
   contents: write
