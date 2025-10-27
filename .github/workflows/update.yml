@@ -1,0 +1,53 @@
+name: Update Eastmoney NAVs
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 每个工作日 10:30 UTC 运行一次（可按需调整）
+    - cron: "30 10 * * 1-5"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run fetch
+        run: python fetch_eastmoney.py
+
+      - name: Commit artifacts
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update NAV data"
+          branch: main
+          file_pattern: |
+            data/*.csv
+            site/*.html
+
+      # 将 site/ 目录发布到 gh-pages 作为 GitHub Pages（静态 HTML 表格）
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
