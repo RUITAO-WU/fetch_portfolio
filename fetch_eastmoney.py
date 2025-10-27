@@ -133,26 +133,18 @@ def write_csv(df: pd.DataFrame, code: str) -> Path:
     log(f"[OUT] CSV -> {p}")
     return p
 
-
 def write_html_table(df: pd.DataFrame, code: str) -> Path:
-    title = f"Fund {code} (Eastmoney) - Historical NAV"
-    table_html = df.to_html(index=False)
-    meta = f"<!-- Generated: {dt.datetime.utcnow().isoformat()}Z -->"
+    # 输出两列且列名固定为 Date / Close（PP 识别更稳）
+    out = df.rename(columns={"Price": "Close"})[["Date", "Close"]].copy()
+
+    # 生成极简 HTML，首元素就是 table
+    table_html = out.to_html(index=False, border=1)  # <table>...两列
     html_page = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<title>{title}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-{meta}
-</head>
-<body>
+<meta charset="utf-8">
 {table_html}
-</body>
-</html>"""
+"""
     p = SITE_DIR / f"{code}.html"
     p.write_text(html_page, encoding="utf-8")
-    log(f"[OUT] HTML -> {p}")
     return p
 
 
