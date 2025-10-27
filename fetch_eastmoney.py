@@ -1,104 +1,79 @@
-import re
-import json
-import os
-import datetime as dt
-from pathlib import Path
-import pandas as pd
+import io
 import requests
-
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
-SITE_DIR = ROOT / "site"
-DATA_DIR.mkdir(exist_ok=True)
-SITE_DIR.mkdir(exist_ok=True)
+import pandas as pd
+import re
+import html
 
 API_TMPL = ("https://fund.eastmoney.com/f10/F10DataApi.aspx"
             "?type=lsjz&code={code}&page=1&per=5000&sdate=2000-01-01&edate=2099-12-31")
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
+
+def _extract_table_html(js_text: str) -> str:
+    m = re.search(r'content\s*[:=]\s*"(.+?)"\s*,\s*(records|pages|curpage)', js_text, re.S)
+    if not m:
+        # 少数场景返回已是纯 HTML
+        t2 = re.search(r"<table[\s\S]*?</table>", js_text, re.I)
+        if not t2:
+            raise RuntimeError("未在响应中找到 content 或 <table> 片段")
+        return t2.group(0)
+    raw = m.group(1)
+    # 还原转义
+    s = raw.replace(r'\"', '"').replace(r"\/", "/")
+    s = s.replace(r"\n", "").replace(r"\r", "").replace(r"\t", "")
+    s = s.encode("utf-8").decode("unicode_escape", errors="ignore")
+    s = html.unescape(s)
+    t = re.search(r"<table[\s\S]*?</table>", s, re.I)
+    if not t:
+        raise RuntimeError("content 中未找到 <table>")
+    return t.group(0)
+
+def _pick_column(columns, keywords, default_idx=None):
+    for kw in keywords:
+        for c in columns:
+            if kw in str(c):
+                return c
+    if default_idx is not None and 0 <= default_idx < len(columns):
+        return columns[default_idx]
+    return None
+
 def fetch_one(code: str) -> pd.DataFrame:
     url = API_TMPL.format(code=code)
-    r = requests.get(url, timeout=20)
+    r = requests.get(url, headers=HEADERS, timeout=25)
     r.raise_for_status()
-    text = r.text
+    table_html = _extract_table_html(r.text)
 
-    # 提取 apidata.content 中的 HTML 表格片段
-    m = re.search(r"var\s+apidata\s*=\s*\{.*?content:\"(.*)\"\s*,\s*records", text, re.S)
-    if not m:
-        raise RuntimeError(f"无法解析接口返回（{code}）")
-    # 还原转义
-    html = m.group(1).encode('utf-8').decode('unicode_escape')
-
-    # 读表（历史净值表头通常含：净值日期、单位净值、累计净值、日增长率、申购状态、赎回状态）
-    tables = pd.read_html(html)
+    # 用 StringIO 传入，避免未来版本警告
+    tables = pd.read_html(io.StringIO(table_html), flavor="lxml")
     if not tables:
-        raise RuntimeError(f"未找到表格（{code}）")
+        raise RuntimeError("pandas 未能读取到表格")
+
     df = tables[0].copy()
 
-    # 兼容不同表头：取“净值日期”“单位净值”
-    date_col = [c for c in df.columns if "日期" in str(c)][0]
-    nav_col = None
-    for key in ["单位净值", "单位", "净值"]:
-        cand = [c for c in df.columns if key in str(c)]
-        if cand:
-            nav_col = cand[0]
-            break
+    # 有些返回首行不是表头，尝试把第一行设为表头
+    if not any(("日" in str(c) or "期" in str(c)) for c in df.columns):
+        df.columns = df.iloc[0]
+        df = df.iloc[1:].reset_index(drop=True)
+
+    cols = list(df.columns)
+
+    # 选择日期列：优先含“净值日期/日期”的列；兜底取第1列
+    date_col = _pick_column(cols, ["净值日期", "日期"], default_idx=0)
+    if date_col is None:
+        raise RuntimeError(f"未找到日期列，实际表头：{cols}")
+
+    # 选择净值列：常见“单位净值/单位净值(元)/净值”；兜底取第2列
+    nav_col = _pick_column(cols, ["单位净值", "单位净值(元)", "单位", "净值"], default_idx=1)
     if nav_col is None:
-        raise RuntimeError(f"未找到单位净值列（{code}）")
+        raise RuntimeError(f"未找到净值列，实际表头：{cols}")
 
     out = df[[date_col, nav_col]].rename(columns={date_col: "Date", nav_col: "Price"})
-
-    # 规范化
-    out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
     out["Price"] = pd.to_numeric(out["Price"], errors="coerce")
-    out = out.dropna().sort_values("Date")
-
+    out = out.dropna(subset=["Date", "Price"]).sort_values("Date")
+    if out.empty:
+        raise RuntimeError("解析后数据为空，请检查接口返回")
     return out
-
-def write_csv(df: pd.DataFrame, code: str):
-    p = DATA_DIR / f"{code}.csv"
-    df.to_csv(p, index=False)  # 头部：Date,Price
-    return p
-
-def write_html_table(df: pd.DataFrame, code: str):
-    # 生成一个简单的 HTML 页面，首张表格为 PP 可识别表
-    title = f"Fund {code} (Eastmoney) - Historical NAV"
-    table_html = df.to_html(index=False)  # 表头为 Date / Price
-    meta = (f"<!-- Generated: {dt.datetime.utcnow().isoformat()}Z -->")
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<title>{title}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-{meta}
-<style>
-body {{ font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; padding: 16px; }}
-table {{ border-collapse: collapse; width: 100%; max-width: 860px; }}
-th, td {{ border: 1px solid #ccc; padding: 6px 8px; text-align: right; }}
-th:first-child, td:first-child {{ text-align: left; }}
-caption {{ text-align:left; font-weight:600; margin-bottom:8px; }}
-.note {{ margin-top:12px; color:#555; font-size:0.9em; }}
-</style>
-</head>
-<body>
-<h1>{title}</h1>
-{table_html}
-<div class="note">
-Columns: <strong>Date</strong> (yyyy-MM-dd), <strong>Price</strong> (CNY).<br/>
-Source: Eastmoney F10DataApi.
-</div>
-</body>
-</html>"""
-    p = SITE_DIR / f"{code}.html"
-    p.write_text(html, encoding="utf-8")
-    return p
-
-def main():
-    conf = json.loads((DATA_DIR / "funds.json").read_text(encoding="utf-8"))
-    for code in conf.get("codes", []):
-        df = fetch_one(code)
-        write_csv(df, code)
-        write_html_table(df, code)
-
-if __name__ == "__main__":
-    main()
