@@ -38,8 +38,9 @@ jobs:
           file_pattern: |
             data/*.csv
             site/*.html
-
-      # 将 site/ 目录发布到 gh-pages 作为 GitHub Pages（静态 HTML 表格）
+            site/*.json
+            
+            # 将 site/ 目录发布到 gh-pages 作为 GitHub Pages（静态 HTML 表格）
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
