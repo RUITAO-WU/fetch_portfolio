@@ -95,8 +95,11 @@ def _first_numeric_col_index(df: pd.DataFrame, exclude_idx: Optional[int]) -> Op
 # ------------------------ Core ------------------------
 
 def fetch_one(code: str) -> pd.DataFrame:
+    """
+    解决：部分基金表格首行被误判为表头，或表头乱码；并支持单位净值缺失时回退累计净值。
+    """
     import io, re, html, pandas as pd, requests
-    from pandas import DataFrame
+    from typing import Optional, List
 
     def _extract_table_html(js_text: str) -> str:
         m = re.search(r'content\s*[:=]\s*"(.+?)"\s*,\s*(records|pages|curpage)', js_text, re.S)
@@ -105,7 +108,10 @@ def fetch_one(code: str) -> pd.DataFrame:
             s = (raw.replace(r'\"','"')
                    .replace(r"\/","/")
                    .replace(r"\n","").replace(r"\r","").replace(r"\t",""))
-            s = s.encode("utf-8").decode("unicode_escape", errors="ignore")
+            try:
+                s = s.encode("utf-8").decode("unicode_escape", errors="ignore")
+            except Exception:
+                pass
             s = html.unescape(s)
             t = re.search(r"<table[\s\S]*?</table>", s, re.I)
             if t: return t.group(0)
@@ -113,65 +119,215 @@ def fetch_one(code: str) -> pd.DataFrame:
         if t2: return t2.group(0)
         raise RuntimeError("no <table> in response")
 
-    # 取第1页（足够覆盖最新行），不改你的分页策略
+    def _find_header_row(df: pd.DataFrame) -> int:
+        """返回表头所在行索引；未找到则 -1。"""
+        keys = ("净值日期", "单位净值", "累计净值", "日增长率")
+        for i in range(min(5, len(df))):  # 只在前几行里找
+            row = "".join(map(str, df.iloc[i].tolist()))
+            if any(k in row for k in keys):
+                return i
+        return -1
+
+    def _pick_idx(columns: List[str], keys: List[str], default: Optional[int]=None) -> Optional[int]:
+        for k in keys:
+            for i, c in enumerate(columns):
+                if k in str(c):
+                    return i
+        return default
+
+    def _to_num(s: pd.Series) -> pd.Series:
+        # 只保留数字与小数点，去千分位
+        return pd.to_numeric(
+            s.astype(str)
+             .str.replace(",", "", regex=False)
+             .str.replace(r"[^0-9.]", "", regex=True),
+            errors="coerce"
+        )
+
+    # —— 抓取第 1 页（最新行所在页）；如需全量可叠加分页逻辑 ——
     url = API_TMPL.format(code=code)
     r = requests.get(url, headers=HEADERS, timeout=25); r.raise_for_status()
     table_html = _extract_table_html(r.text)
 
-    tables = pd.read_html(io.StringIO(table_html), flavor="lxml")
+    # 关键：强制无表头读取
+    tables = pd.read_html(io.StringIO(table_html), flavor="lxml", header=None)
     if not tables:
         raise RuntimeError("pandas.read_html found no table")
-    df = tables[0].copy()
+    raw = tables[0].copy()
 
-    # 首行可能是表头
-    if not any(("日" in str(c) or "期" in str(c)) for c in df.columns):
-        df.columns = df.iloc[0]; df = df.iloc[1:].reset_index(drop=True)
+    # 去除全空列/行
+    raw = raw.dropna(how="all", axis=1)
+    raw = raw.dropna(how="all", axis=0).reset_index(drop=True)
 
-    # 列名索引（用下标避免重名列导致 Series/DataFrame 混淆）
-    cols = list(df.columns)
+    # 在表内定位真正表头行
+    hdr = _find_header_row(raw)
+    if hdr >= 0:
+        raw.columns = raw.iloc[hdr].astype(str).tolist()
+        df = raw.iloc[hdr+1:].reset_index(drop=True)
+    else:
+        # 找不到表头行：若首列长得像日期，则用已知模板回填列名
+        cols_template = ["净值日期","单位净值","累计净值","日增长率","申购状态","赎回状态","分红送配"]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", str(raw.iloc[0,0])):
+            df = raw.copy()
+            df.columns = cols_template[: df.shape[1]]
+        else:
+            # 退一步：把第一行当表头（比把数据行当表头强）
+            df = raw.copy()
+            df.columns = df.iloc[0].astype(str).tolist()
+            df = df.iloc[1:].reset_index(drop=True)
 
-    def pick_idx(columns, keys, default=None):
-        for k in keys:
-            for i, c in enumerate(columns):
-                if k in str(c): return i
-        return default
-
-    date_idx = pick_idx(cols, ["净值日期", "日期"], default=0)
-    unit_idx = pick_idx(cols, ["单位净值", "单位净值(元)", "单位"])
-    accu_idx = pick_idx(cols, ["累计净值", "累计净值(元)", "累计"])
+    # 选择列（按名字；失败再兜底）
+    cols = list(map(str, df.columns))
+    date_idx = _pick_idx(cols, ["净值日期", "日期"], default=0)
+    unit_idx = _pick_idx(cols, ["单位净值", "单位净值(元)", "单位"])
+    accu_idx = _pick_idx(cols, ["累计净值", "累计净值(元)", "累计"])
 
     if date_idx is None:
         raise RuntimeError(f"no date column, headers={cols}")
     if unit_idx is None and accu_idx is None:
-        raise RuntimeError(f"no NAV columns, headers={cols}")
+        # 再兜底：从第2列起找首个“多数可转数值”的列当净值
+        best_i, best_cnt = None, -1
+        for i in range(1, df.shape[1]):
+            s = _to_num(df.iloc[:, i])
+            c = s.notna().sum()
+            if c > best_cnt:
+                best_i, best_cnt = i, c
+        if best_i is None:
+            raise RuntimeError(f"no NAV columns, headers={cols}")
+        unit_idx = best_i  # 用兜底列
 
-    # 清洗函数：只保留数字与小数点（防止出现 '1.2345*'、'—' 等）
-    import numpy as np
-    def to_num_series(s):
+    # 行级回退：单位净值缺时用累计净值
+    date_ser = pd.to_datetime(df.iloc[:, date_idx], errors="coerce").dt.strftime("%Y-%m-%d")
+    unit_ser = _to_num(df.iloc[:, unit_idx]) if unit_idx is not None else None
+    accu_ser = _to_num(df.iloc[:, accu_idx]) if accu_idx is not None else None
+    price = unit_ser.combine_first(accu_ser) if (unit_ser is not None and accu_ser is not None) \
+            else (unit_ser if unit_ser is not None else accu_ser)
+
+    out = pd.DataFrame({"Date": date_ser, "Price": price}) \
+           .dropna(subset=["Date","Price"]) \
+           .drop_duplicates() \
+           .sort_values("Date") \
+           .reset_index(drop=True)
+
+    if out.empty:
+        raise RuntimeError("parsed empty after header-fix and unit->accu fallback")
+    return outdef fetch_one(code: str) -> pd.DataFrame:
+    """
+    解决：部分基金表格首行被误判为表头，或表头乱码；并支持单位净值缺失时回退累计净值。
+    """
+    import io, re, html, pandas as pd, requests
+    from typing import Optional, List
+
+    def _extract_table_html(js_text: str) -> str:
+        m = re.search(r'content\s*[:=]\s*"(.+?)"\s*,\s*(records|pages|curpage)', js_text, re.S)
+        if m:
+            raw = m.group(1)
+            s = (raw.replace(r'\"','"')
+                   .replace(r"\/","/")
+                   .replace(r"\n","").replace(r"\r","").replace(r"\t",""))
+            try:
+                s = s.encode("utf-8").decode("unicode_escape", errors="ignore")
+            except Exception:
+                pass
+            s = html.unescape(s)
+            t = re.search(r"<table[\s\S]*?</table>", s, re.I)
+            if t: return t.group(0)
+        t2 = re.search(r"<table[\s\S]*?</table>", js_text, re.I)
+        if t2: return t2.group(0)
+        raise RuntimeError("no <table> in response")
+
+    def _find_header_row(df: pd.DataFrame) -> int:
+        """返回表头所在行索引；未找到则 -1。"""
+        keys = ("净值日期", "单位净值", "累计净值", "日增长率")
+        for i in range(min(5, len(df))):  # 只在前几行里找
+            row = "".join(map(str, df.iloc[i].tolist()))
+            if any(k in row for k in keys):
+                return i
+        return -1
+
+    def _pick_idx(columns: List[str], keys: List[str], default: Optional[int]=None) -> Optional[int]:
+        for k in keys:
+            for i, c in enumerate(columns):
+                if k in str(c):
+                    return i
+        return default
+
+    def _to_num(s: pd.Series) -> pd.Series:
+        # 只保留数字与小数点，去千分位
         return pd.to_numeric(
-            s.astype(str).str.replace(r"[^0-9.]", "", regex=True),
+            s.astype(str)
+             .str.replace(",", "", regex=False)
+             .str.replace(r"[^0-9.]", "", regex=True),
             errors="coerce"
         )
 
-    date_ser = pd.to_datetime(df.iloc[:, date_idx], errors="coerce").dt.strftime("%Y-%m-%d")
+    # —— 抓取第 1 页（最新行所在页）；如需全量可叠加分页逻辑 ——
+    url = API_TMPL.format(code=code)
+    r = requests.get(url, headers=HEADERS, timeout=25); r.raise_for_status()
+    table_html = _extract_table_html(r.text)
 
-    unit_ser = to_num_series(df.iloc[:, unit_idx]) if unit_idx is not None else None
-    accu_ser = to_num_series(df.iloc[:, accu_idx]) if accu_idx is not None else None
+    # 关键：强制无表头读取
+    tables = pd.read_html(io.StringIO(table_html), flavor="lxml", header=None)
+    if not tables:
+        raise RuntimeError("pandas.read_html found no table")
+    raw = tables[0].copy()
 
-    # 行级回退：优先单位净值；若为空则用累计净值
-    if unit_ser is not None and accu_ser is not None:
-        price = unit_ser.combine_first(accu_ser)
+    # 去除全空列/行
+    raw = raw.dropna(how="all", axis=1)
+    raw = raw.dropna(how="all", axis=0).reset_index(drop=True)
+
+    # 在表内定位真正表头行
+    hdr = _find_header_row(raw)
+    if hdr >= 0:
+        raw.columns = raw.iloc[hdr].astype(str).tolist()
+        df = raw.iloc[hdr+1:].reset_index(drop=True)
     else:
-        price = unit_ser if unit_ser is not None else accu_ser
+        # 找不到表头行：若首列长得像日期，则用已知模板回填列名
+        cols_template = ["净值日期","单位净值","累计净值","日增长率","申购状态","赎回状态","分红送配"]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", str(raw.iloc[0,0])):
+            df = raw.copy()
+            df.columns = cols_template[: df.shape[1]]
+        else:
+            # 退一步：把第一行当表头（比把数据行当表头强）
+            df = raw.copy()
+            df.columns = df.iloc[0].astype(str).tolist()
+            df = df.iloc[1:].reset_index(drop=True)
+
+    # 选择列（按名字；失败再兜底）
+    cols = list(map(str, df.columns))
+    date_idx = _pick_idx(cols, ["净值日期", "日期"], default=0)
+    unit_idx = _pick_idx(cols, ["单位净值", "单位净值(元)", "单位"])
+    accu_idx = _pick_idx(cols, ["累计净值", "累计净值(元)", "累计"])
+
+    if date_idx is None:
+        raise RuntimeError(f"no date column, headers={cols}")
+    if unit_idx is None and accu_idx is None:
+        # 再兜底：从第2列起找首个“多数可转数值”的列当净值
+        best_i, best_cnt = None, -1
+        for i in range(1, df.shape[1]):
+            s = _to_num(df.iloc[:, i])
+            c = s.notna().sum()
+            if c > best_cnt:
+                best_i, best_cnt = i, c
+        if best_i is None:
+            raise RuntimeError(f"no NAV columns, headers={cols}")
+        unit_idx = best_i  # 用兜底列
+
+    # 行级回退：单位净值缺时用累计净值
+    date_ser = pd.to_datetime(df.iloc[:, date_idx], errors="coerce").dt.strftime("%Y-%m-%d")
+    unit_ser = _to_num(df.iloc[:, unit_idx]) if unit_idx is not None else None
+    accu_ser = _to_num(df.iloc[:, accu_idx]) if accu_idx is not None else None
+    price = unit_ser.combine_first(accu_ser) if (unit_ser is not None and accu_ser is not None) \
+            else (unit_ser if unit_ser is not None else accu_ser)
 
     out = pd.DataFrame({"Date": date_ser, "Price": price}) \
-            .dropna(subset=["Date", "Price"]) \
-            .drop_duplicates() \
-            .sort_values("Date") \
-            .reset_index(drop=True)
+           .dropna(subset=["Date","Price"]) \
+           .drop_duplicates() \
+           .sort_values("Date") \
+           .reset_index(drop=True)
 
     if out.empty:
-        raise RuntimeError("parsed empty after unit->accu fallback")
+        raise RuntimeError("parsed empty after header-fix and unit->accu fallback")
     return out
 # ------------------------ Writers ------------------------
 
