@@ -7,8 +7,8 @@ Fetch Eastmoney fund historical NAVs and produce:
 - site/{code}.html   (minimal <table> with Date/Close)
 - site/{code}.json   ([{"date":"YYYY-MM-DD","close":X.YZ}, ...])
 
-Fund codes are read from data/funds.json, e.g.:
-{ "codes": ["001316", "161725"] }
+Fund codes in data/funds.json, e.g.:
+{ "codes": ["001316", "022907"] }
 """
 
 import io
@@ -45,21 +45,16 @@ HEADERS = {
     )
 }
 
-RETRY_TIMES = 3          # 每只基金最多重试次数
-RETRY_SLEEP_SEC = 3      # 单次失败后的等待
-BETWEEN_FUNDS_SLEEP = 2  # 相邻两只基金之间的等待（防限流）
+RETRY_TIMES = 3
+RETRY_SLEEP_SEC = 3
+BETWEEN_FUNDS_SLEEP = 2
 
-# ------------------------ Utilities ------------------------
+# ------------------------ Utils ------------------------
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 def _extract_table_html(js_text: str) -> str:
-    """
-    从 Eastmoney 的响应中提取第一张 <table>…</table>
-    兼容 apidata.content 的转义字符串和直接 HTML 两种返回。
-    """
-    # 优先：从 apidata.content 里取
     m = re.search(r'content\s*[:=]\s*"(.+?)"\s*,\s*(records|pages|curpage)', js_text, re.S)
     if m:
         raw = m.group(1)
@@ -73,42 +68,33 @@ def _extract_table_html(js_text: str) -> str:
         t = re.search(r"<table[\s\S]*?</table>", s, re.I)
         if t:
             return t.group(0)
-
-    # 兜底：响应本身已是 HTML
     t2 = re.search(r"<table[\s\S]*?</table>", js_text, re.I)
     if t2:
         return t2.group(0)
-
     raise RuntimeError("Failed to locate <table> HTML in response")
 
-def _pick_column(columns: List[str], keywords: List[str], default_idx: Optional[int]=None) -> Optional[str]:
+def _pick_col_index(cols: List[str], keywords: List[str], default_idx: Optional[int]=None) -> Optional[int]:
     for kw in keywords:
-        for c in columns:
+        for i, c in enumerate(cols):
             if kw in str(c):
-                return c
-    if default_idx is not None and 0 <= default_idx < len(columns):
-        return columns[default_idx]
+                return i
+    if default_idx is not None and 0 <= default_idx < len(cols):
+        return default_idx
     return None
 
-def _first_numeric_column(df: pd.DataFrame, exclude_cols: List[str]) -> Optional[str]:
-    """
-    在 DataFrame 中找第一个可转换为数值的列（排除 exclude_cols）。
-    """
-    for c in df.columns:
-        if c in exclude_cols:
+def _first_numeric_col_index(df: pd.DataFrame, exclude_idx: Optional[int]) -> Optional[int]:
+    for i in range(len(df.columns)):
+        if exclude_idx is not None and i == exclude_idx:
             continue
-        s = pd.to_numeric(df[c].astype(str).str.replace(",", ""), errors="coerce")
-        if s.notna().sum() >= max(3, int(len(s) * 0.2)):  # 有一定比例可转为数值
-            return c
+        s = df.iloc[:, i].astype(str).str.replace(",", "", regex=False)
+        s = pd.to_numeric(s, errors="coerce")
+        if s.notna().sum() >= max(3, int(len(s) * 0.2)):
+            return i
     return None
 
-# ------------------------ Core Fetch ------------------------
+# ------------------------ Core ------------------------
 
 def fetch_one(code: str) -> pd.DataFrame:
-    """
-    抓取单只基金，带重试与解析兜底。
-    返回标准列：Date, Price
-    """
     url = API_TMPL.format(code=code)
     last_err = None
 
@@ -125,36 +111,37 @@ def fetch_one(code: str) -> pd.DataFrame:
 
             df = tables[0].copy()
 
-            # 某些返回第一行是表头，显式设置
+            # 若首行是表头，提取之
             if not any(("日" in str(c) or "期" in str(c)) for c in df.columns):
                 df.columns = df.iloc[0]
                 df = df.iloc[1:].reset_index(drop=True)
 
-            # 清洗：去除全空列/空行
-            df = df.loc[:, ~df.columns.astype(str).str.fullmatch(r"\s*")]
+            # 清理空列/空行
+            df = df.loc[:, [not str(c).strip() == "" for c in df.columns]]
             df = df.dropna(how="all").reset_index(drop=True)
 
             cols = list(df.columns)
 
-            # 日期列
-            date_col = _pick_column(cols, ["净值日期", "日期"], default_idx=0)
-            if date_col is None:
+            # 选日期列（索引）
+            date_idx = _pick_col_index(cols, ["净值日期", "日期"], default_idx=0)
+            if date_idx is None:
                 raise RuntimeError(f"Cannot find date column. Headers: {cols}")
 
-            # 净值列：优先关键词；不行则找首个数值列
-            nav_col = _pick_column(cols, ["单位净值", "单位净值(元)", "单位", "净值"], default_idx=None)
-            if nav_col is None:
-                nav_col = _first_numeric_column(df, exclude_cols=[date_col])
-            if nav_col is None:
+            # 选净值列（索引）：优先关键词，不行就找第一个数值列
+            nav_idx = _pick_col_index(cols, ["单位净值", "单位净值(元)", "单位", "净值"], default_idx=None)
+            if nav_idx is None:
+                nav_idx = _first_numeric_col_index(df, exclude_idx=date_idx)
+            if nav_idx is None:
                 raise RuntimeError(f"Cannot find numeric NAV column. Headers: {cols}")
 
-            out = df[[date_col, nav_col]].rename(columns={date_col: "Date", nav_col: "Price"}).copy()
+            # 取单列 Series（用 iloc，避免重名列产生 DataFrame）
+            date_ser = df.iloc[:, date_idx].astype(str)
+            nav_ser = df.iloc[:, nav_idx].astype(str).str.replace(",", "", regex=False)
 
-            # 规范化
-            out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-            # 去掉千分位逗号
-            out["Price"] = pd.to_numeric(out["Price"].astype(str).str.replace(",", ""), errors="coerce")
-            out = out.dropna(subset=["Date", "Price"]).sort_values("Date").reset_index(drop=True)
+            out = pd.DataFrame({
+                "Date": pd.to_datetime(date_ser, errors="coerce").dt.strftime("%Y-%m-%d"),
+                "Price": pd.to_numeric(nav_ser, errors="coerce")
+            }).dropna(subset=["Date", "Price"]).sort_values("Date").reset_index(drop=True)
 
             if out.empty:
                 raise RuntimeError("Parsed data is empty")
@@ -167,7 +154,6 @@ def fetch_one(code: str) -> pd.DataFrame:
             if attempt < RETRY_TIMES:
                 time.sleep(RETRY_SLEEP_SEC)
 
-    # 重试失败
     raise RuntimeError(f"Failed after {RETRY_TIMES} attempts for {code}: {last_err}")
 
 # ------------------------ Writers ------------------------
@@ -179,7 +165,6 @@ def write_csv(df: pd.DataFrame, code: str) -> Path:
     return p
 
 def write_html_table(df: pd.DataFrame, code: str) -> Path:
-    # PP 对两列英文字段名最稳：Date / Close；放在文档最前面且尽量简洁
     out = df.rename(columns={"Price": "Close"})[["Date", "Close"]].copy()
     table_html = out.to_html(index=False, border=1)
     html_page = f"""<!doctype html>
@@ -192,10 +177,7 @@ def write_html_table(df: pd.DataFrame, code: str) -> Path:
     return p
 
 def write_json(df: pd.DataFrame, code: str) -> Path:
-    payload = [
-        {"date": d, "close": float(p)}
-        for d, p in df[["Date", "Price"]].itertuples(index=False, name=None)
-    ]
+    payload = [{"date": d, "close": float(p)} for d, p in df[["Date", "Price"]].itertuples(index=False, name=None)]
     p = SITE_DIR / f"{code}.json"
     p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     log(f"[OUT] JSON -> {p}")
@@ -233,7 +215,6 @@ def main() -> None:
         except Exception as e:
             fail_cnt += 1
             log(f"[FAIL] {code}: {e}")
-        # 相邻两只基金之间等待，降低被限流概率
         time.sleep(BETWEEN_FUNDS_SLEEP)
 
     if ok_cnt == 0:
