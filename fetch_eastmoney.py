@@ -95,67 +95,84 @@ def _first_numeric_col_index(df: pd.DataFrame, exclude_idx: Optional[int]) -> Op
 # ------------------------ Core ------------------------
 
 def fetch_one(code: str) -> pd.DataFrame:
+    import io, re, html, pandas as pd, requests
+    from pandas import DataFrame
+
+    def _extract_table_html(js_text: str) -> str:
+        m = re.search(r'content\s*[:=]\s*"(.+?)"\s*,\s*(records|pages|curpage)', js_text, re.S)
+        if m:
+            raw = m.group(1)
+            s = (raw.replace(r'\"','"')
+                   .replace(r"\/","/")
+                   .replace(r"\n","").replace(r"\r","").replace(r"\t",""))
+            s = s.encode("utf-8").decode("unicode_escape", errors="ignore")
+            s = html.unescape(s)
+            t = re.search(r"<table[\s\S]*?</table>", s, re.I)
+            if t: return t.group(0)
+        t2 = re.search(r"<table[\s\S]*?</table>", js_text, re.I)
+        if t2: return t2.group(0)
+        raise RuntimeError("no <table> in response")
+
+    # 取第1页（足够覆盖最新行），不改你的分页策略
     url = API_TMPL.format(code=code)
-    last_err = None
+    r = requests.get(url, headers=HEADERS, timeout=25); r.raise_for_status()
+    table_html = _extract_table_html(r.text)
 
-    for attempt in range(1, RETRY_TIMES + 1):
-        try:
-            log(f"[REQ] {code} -> {url} (try {attempt}/{RETRY_TIMES})")
-            r = requests.get(url, headers=HEADERS, timeout=25)
-            r.raise_for_status()
+    tables = pd.read_html(io.StringIO(table_html), flavor="lxml")
+    if not tables:
+        raise RuntimeError("pandas.read_html found no table")
+    df = tables[0].copy()
 
-            table_html = _extract_table_html(r.text)
-            tables = pd.read_html(io.StringIO(table_html), flavor="lxml")
-            if not tables:
-                raise RuntimeError("pandas.read_html found no table")
+    # 首行可能是表头
+    if not any(("日" in str(c) or "期" in str(c)) for c in df.columns):
+        df.columns = df.iloc[0]; df = df.iloc[1:].reset_index(drop=True)
 
-            df = tables[0].copy()
+    # 列名索引（用下标避免重名列导致 Series/DataFrame 混淆）
+    cols = list(df.columns)
 
-            # 若首行是表头，提取之
-            if not any(("日" in str(c) or "期" in str(c)) for c in df.columns):
-                df.columns = df.iloc[0]
-                df = df.iloc[1:].reset_index(drop=True)
+    def pick_idx(columns, keys, default=None):
+        for k in keys:
+            for i, c in enumerate(columns):
+                if k in str(c): return i
+        return default
 
-            # 清理空列/空行
-            df = df.loc[:, [not str(c).strip() == "" for c in df.columns]]
-            df = df.dropna(how="all").reset_index(drop=True)
+    date_idx = pick_idx(cols, ["净值日期", "日期"], default=0)
+    unit_idx = pick_idx(cols, ["单位净值", "单位净值(元)", "单位"])
+    accu_idx = pick_idx(cols, ["累计净值", "累计净值(元)", "累计"])
 
-            cols = list(df.columns)
+    if date_idx is None:
+        raise RuntimeError(f"no date column, headers={cols}")
+    if unit_idx is None and accu_idx is None:
+        raise RuntimeError(f"no NAV columns, headers={cols}")
 
-            # 选日期列（索引）
-            date_idx = _pick_col_index(cols, ["净值日期", "日期"], default_idx=0)
-            if date_idx is None:
-                raise RuntimeError(f"Cannot find date column. Headers: {cols}")
+    # 清洗函数：只保留数字与小数点（防止出现 '1.2345*'、'—' 等）
+    import numpy as np
+    def to_num_series(s):
+        return pd.to_numeric(
+            s.astype(str).str.replace(r"[^0-9.]", "", regex=True),
+            errors="coerce"
+        )
 
-            # 选净值列（索引）：优先关键词，不行就找第一个数值列
-            nav_idx = _pick_col_index(cols, ["单位净值", "单位净值(元)", "单位", "净值"], default_idx=None)
-            if nav_idx is None:
-                nav_idx = _first_numeric_col_index(df, exclude_idx=date_idx)
-            if nav_idx is None:
-                raise RuntimeError(f"Cannot find numeric NAV column. Headers: {cols}")
+    date_ser = pd.to_datetime(df.iloc[:, date_idx], errors="coerce").dt.strftime("%Y-%m-%d")
 
-            # 取单列 Series（用 iloc，避免重名列产生 DataFrame）
-            date_ser = df.iloc[:, date_idx].astype(str)
-            nav_ser = df.iloc[:, nav_idx].astype(str).str.replace(",", "", regex=False)
+    unit_ser = to_num_series(df.iloc[:, unit_idx]) if unit_idx is not None else None
+    accu_ser = to_num_series(df.iloc[:, accu_idx]) if accu_idx is not None else None
 
-            out = pd.DataFrame({
-                "Date": pd.to_datetime(date_ser, errors="coerce").dt.strftime("%Y-%m-%d"),
-                "Price": pd.to_numeric(nav_ser, errors="coerce")
-            }).dropna(subset=["Date", "Price"]).sort_values("Date").reset_index(drop=True)
+    # 行级回退：优先单位净值；若为空则用累计净值
+    if unit_ser is not None and accu_ser is not None:
+        price = unit_ser.combine_first(accu_ser)
+    else:
+        price = unit_ser if unit_ser is not None else accu_ser
 
-            if out.empty:
-                raise RuntimeError("Parsed data is empty")
+    out = pd.DataFrame({"Date": date_ser, "Price": price}) \
+            .dropna(subset=["Date", "Price"]) \
+            .drop_duplicates() \
+            .sort_values("Date") \
+            .reset_index(drop=True)
 
-            return out
-
-        except Exception as e:
-            last_err = e
-            log(f"[WARN] {code} attempt {attempt} failed: {e}")
-            if attempt < RETRY_TIMES:
-                time.sleep(RETRY_SLEEP_SEC)
-
-    raise RuntimeError(f"Failed after {RETRY_TIMES} attempts for {code}: {last_err}")
-
+    if out.empty:
+        raise RuntimeError("parsed empty after unit->accu fallback")
+    return out
 # ------------------------ Writers ------------------------
 
 def write_csv(df: pd.DataFrame, code: str) -> Path:
