@@ -214,37 +214,117 @@ def _probe_total_pages(code: str) -> int:
 
 def fetch_one(code: str) -> pd.DataFrame:
     """
-    抓取单只基金（分页 + 重试），返回标准列：Date, Price（升序去重）。
+    只抓第 1 页；修正表头误判/乱码；单位净值缺失时回退累计净值。
+    返回列：Date, Price（升序）。
     """
-    last_err = None
-    for attempt in range(1, RETRY_TIMES + 1):
-        try:
-            pages = _probe_total_pages(code)
-            frames: List[pd.DataFrame] = []
-            for p in range(1, pages + 1):
-                part = _read_one_page(code, p)
-                if not part.empty:
-                    frames.append(part)
-                time.sleep(0.6)  # 轻微节流，防止被限
-            if not frames:
-                raise RuntimeError("no parsed rows from all pages")
-            df_all = pd.concat(frames, ignore_index=True)
-            # 统一清洗：去重、排序、规范化
-            df_all["Date"] = pd.to_datetime(df_all["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-            df_all["Price"] = pd.to_numeric(df_all["Price"], errors="coerce")
-            out = (df_all.dropna(subset=["Date","Price"])
-                          .drop_duplicates()
-                          .sort_values("Date")
-                          .reset_index(drop=True))
-            if out.empty:
-                raise RuntimeError("parsed empty after concat/clean")
-            return out
-        except Exception as e:
-            last_err = e
-            log(f"[WARN] {code} attempt {attempt} failed: {e}")
-            if attempt < RETRY_TIMES:
-                time.sleep(RETRY_SLEEP_SEC)
-    raise RuntimeError(f"Failed after {RETRY_TIMES} attempts for {code}: {last_err}")
+    import io, re, html, pandas as pd, requests
+
+    def _extract_table_html(js_text: str) -> str:
+        m = re.search(r'content\s*[:=]\s*"(.+?)"\s*,\s*(records|pages|curpage)', js_text, re.S)
+        if m:
+            raw = m.group(1)
+            s = (raw.replace(r'\"','"')
+                   .replace(r"\/","/")
+                   .replace(r"\n","").replace(r"\r","").replace(r"\t",""))
+            try:
+                s = s.encode("utf-8").decode("unicode_escape", errors="ignore")
+            except Exception:
+                pass
+            s = html.unescape(s)
+            t = re.search(r"<table[\s\S]*?</table>", s, re.I)
+            if t: return t.group(0)
+        t2 = re.search(r"<table[\s\S]*?</table>", js_text, re.I)
+        if t2: return t2.group(0)
+        raise RuntimeError("no <table> in response")
+
+    def _find_header_row(df: pd.DataFrame) -> int:
+        keys = ("净值日期", "单位净值", "累计净值", "日增长率")
+        for i in range(min(6, len(df))):
+            row_text = "".join(map(str, df.iloc[i].tolist()))
+            if any(k in row_text for k in keys):
+                return i
+        return -1
+
+    def _pick_idx(columns, keys, default=None):
+        for k in keys:
+            for i, c in enumerate(columns):
+                if k in str(c):
+                    return i
+        return default
+
+    def _to_num(s: pd.Series) -> pd.Series:
+        return pd.to_numeric(
+            s.astype(str)
+             .str.replace(",", "", regex=False)
+             .str.replace(r"[^0-9.]", "", regex=True),
+            errors="coerce"
+        )
+
+    # —— 仅第 1 页（per 放大以覆盖更多近期记录） ——
+    url = API_TMPL_PAGE.format(code=code, page=1)
+    log(f"[REQ] {code} -> {url}")
+    r = requests.get(url, headers=HEADERS, timeout=25); r.raise_for_status()
+    table_html = _extract_table_html(r.text)
+
+    # 强制无表头读取，防“首行数据当表头”
+    tables = pd.read_html(io.StringIO(table_html), flavor="lxml", header=None)
+    if not tables:
+        raise RuntimeError("pandas.read_html found no table")
+    raw = tables[0].copy()
+
+    # 去空列/空行
+    raw = raw.dropna(how="all", axis=1)
+    raw = raw.dropna(how="all", axis=0).reset_index(drop=True)
+    if raw.empty:
+        raise RuntimeError("empty table")
+
+    # 在表内定位真实表头
+    hdr = _find_header_row(raw)
+    if hdr >= 0:
+        raw.columns = raw.iloc[hdr].astype(str).tolist()
+        df = raw.iloc[hdr+1:].reset_index(drop=True)
+    else:
+        cols_template = ["净值日期","单位净值","累计净值","日增长率","申购状态","赎回状态","分红送配"]
+        first_val = str(raw.iloc[0,0])
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", first_val):
+            df = raw.copy()
+            df.columns = cols_template[: df.shape[1]]
+        else:
+            df = raw.copy()
+            df.columns = df.iloc[0].astype(str).tolist()
+            df = df.iloc[1:].reset_index(drop=True)
+
+    cols = list(map(str, df.columns))
+    date_idx = _pick_idx(cols, ["净值日期", "日期"], default=0)
+    unit_idx = _pick_idx(cols, ["单位净值", "单位净值(元)", "单位"])
+    accu_idx = _pick_idx(cols, ["累计净值", "累计净值(元)", "累计"])
+
+    if date_idx is None:
+        raise RuntimeError(f"no date column, headers={cols}")
+
+    date_ser = pd.to_datetime(df.iloc[:, date_idx], errors="coerce").dt.strftime("%Y-%m-%d")
+    unit_ser = _to_num(df.iloc[:, unit_idx]) if unit_idx is not None else None
+    accu_ser = _to_num(df.iloc[:, accu_idx]) if accu_idx is not None else None
+
+    # 行级回退：单位净值缺 -> 用累计净值
+    if unit_ser is not None and accu_ser is not None:
+        price = unit_ser.combine_first(accu_ser)
+    elif unit_ser is not None:
+        price = unit_ser
+    elif accu_ser is not None:
+        price = accu_ser
+    else:
+        raise RuntimeError(f"no NAV columns, headers={cols}")
+
+    out = (pd.DataFrame({"Date": date_ser, "Price": price})
+           .dropna(subset=["Date","Price"])
+           .drop_duplicates()
+           .sort_values("Date")
+           .reset_index(drop=True))
+
+    if out.empty:
+        raise RuntimeError("parsed empty after fixes")
+    return out
 
 # ------------------------ Writers ------------------------
 
