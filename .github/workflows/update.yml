@@ -3,8 +3,8 @@ name: Update Eastmoney NAVs
 on:
   workflow_dispatch: {}
   schedule:
-    # 每个工作日 15:05 UTC 运行一次（可按需调整）
-    - cron: "05 23 * * *"
+    # 每个工作日 20:05 UTC 运行一次（可按需调整）
+    - cron: "05 01 * * *"
 
 permissions:
   contents: write
