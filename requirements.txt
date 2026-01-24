@@ -2,3 +2,4 @@ pandas>=2.2
 lxml>=5.3
 html5lib>=1.1
 requests>=2.32
+numpy>=1.26
