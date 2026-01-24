@@ -255,15 +255,15 @@ def fetch_lof_close(secid: str, stem: str) -> pd.DataFrame:
     LOF 场内：抓取历史日K收盘价（Close），返回 Date, Price（升序）
     secid: "1.xxxxxx"(沪) / "0.xxxxxx"(深)
     """
-   params = dict(KLINE_BASE_PARAMS)
-   params["secid"] = secid
-   
-   # ---- limit to recent ~1 month ----
-   end = pd.Timestamp.today().strftime("%Y%m%d")
-   beg = (pd.Timestamp.today() - pd.Timedelta(days=LOF_DAYS)).strftime("%Y%m%d")
-   params["beg"] = beg
-   params["end"] = end
-   params["lmt"] = "200"
+    params = dict(KLINE_BASE_PARAMS)
+    params["secid"] = secid
+    
+    # ---- limit to recent ~1 month ----
+    end = pd.Timestamp.today().strftime("%Y%m%d")
+    beg = (pd.Timestamp.today() - pd.Timedelta(days=LOF_DAYS)).strftime("%Y%m%d")
+    params["beg"] = beg
+    params["end"] = end
+    params["lmt"] = "200"
 
     headers = {**HEADERS, "Referer": "https://quote.eastmoney.com/"}
     log(f"[REQ] LOF {stem} (secid={secid}) -> {KLINE_URL}")
