@@ -2,13 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-Fetch Eastmoney fund historical NAVs and produce:
-- data/{code}.csv    (Date,Price)
-- site/{code}.html   (minimal <table> with Date/Close)
-- site/{code}.json   ([{"date":"YYYY-MM-DD","close":X.YZ}, ...])
+Fetch Eastmoney data and produce:
+- data/{stem}.csv    (Date,Price)
+- site/{stem}.html   (minimal <table> with Date/Close)
+- site/{stem}.json   ([{"date":"YYYY-MM-DD","close":X.YZ}, ...])
 
-Fund codes are read from data/funds.json, e.g.:
-{ "codes": ["001316", "022907"] }
+Supports two symbol types in data/funds.json:
+
+1) OTC funds (NAV): 6 digits
+   e.g. "001316", "022907"
+   -> fetch historical NAV (单位净值/累计净值) via type=lsjz
+
+2) LOF (exchange close): 6 digits + .SS / .SZ
+   e.g. "166009.SZ", "501018.SS"
+   -> fetch daily Kline close price via push2his kline API
+
+Example data/funds.json:
+{ "codes": ["001316", "022907", "166009.SZ", "501018.SS"] }
 """
 
 import io
@@ -17,10 +27,10 @@ import json
 import html
 import sys
 import time
-import datetime as dt
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -32,14 +42,24 @@ SITE_DIR = ROOT / "site"
 DATA_DIR.mkdir(exist_ok=True)
 SITE_DIR.mkdir(exist_ok=True)
 
-API_TMPL_PAGE = (
+# --- OTC Fund NAV (历史净值) ---
+API_TMPL_PAGE_NAV = (
     "https://fund.eastmoney.com/f10/F10DataApi.aspx"
     "?type=lsjz&code={code}&page={page}&per=50&sdate=2000-01-01&edate=2099-12-31"
 )
-API_TMPL_PROBE = (
-    "https://fund.eastmoney.com/f10/F10DataApi.aspx"
-    "?type=lsjz&code={code}&page=1&per=50&sdate=2000-01-01&edate=2099-12-31"
-)
+
+# --- LOF Close (历史K线) ---
+KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+KLINE_BASE_PARAMS = {
+    "klt": "101",  # 101=日线
+    "fqt": "0",    # 0=不复权；1=前复权；2=后复权
+    "beg": "20000101",
+    "end": "20991231",
+    "lmt": "100000",
+    "fields1": "f1,f2,f3,f4,f5,f6",
+    # f51 日期, f52 开, f53 收, f54 高, f55 低, f56 量, f57 额
+    "fields2": "f51,f52,f53,f54,f55,f56,f57",
+}
 
 HEADERS = {
     "User-Agent": (
@@ -49,15 +69,55 @@ HEADERS = {
     )
 }
 
-RETRY_TIMES = 3          # 每只基金最多重试
+RETRY_TIMES = 3          # 每只标的最多重试次数
 RETRY_SLEEP_SEC = 3      # 失败后的等待
-BETWEEN_FUNDS_SLEEP = 2  # 相邻基金之间等待，降低限流
-MAX_PAGES = None         # None 表示抓取全部页；如需仅抓第一页，可设为 1
+BETWEEN_FUNDS_SLEEP = 2  # 相邻标的之间等待，降低限流
 
 # ------------------------ Utilities ------------------------
 
+CODE_NAV_RE = re.compile(r"^\d{6}$")
+CODE_LOF_RE = re.compile(r"^(?P<code>\d{6})\.(?P<mkt>SS|SZ)$", re.I)
+
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+def parse_symbol(sym: str) -> Dict[str, Any]:
+    """
+    Returns dict:
+      kind: "nav" | "lof"
+      code: 6-digit
+      secid: "1.xxxxxx" / "0.xxxxxx" (lof only)
+      stem: filename stem (safe, unique)
+    """
+    s = sym.strip()
+    if CODE_NAV_RE.match(s):
+        return {"kind": "nav", "code": s, "secid": None, "stem": s, "raw": s}
+
+    m = CODE_LOF_RE.match(s)
+    if m:
+        code = m.group("code")
+        mkt = m.group("mkt").upper()
+        secid = ("1." if mkt == "SS" else "0.") + code
+        stem = f"{code}_{mkt}"  # avoid dot in filenames; avoid collision with OTC same 6 digits
+        return {"kind": "lof", "code": code, "secid": secid, "stem": stem, "raw": s}
+
+    raise ValueError(f"invalid symbol: {sym}")
+
+def request_with_retry(method, url: str, *, params=None, headers=None, timeout=25, expect_json=False) -> Any:
+    last_err = None
+    for attempt in range(1, RETRY_TIMES + 1):
+        try:
+            r = method(url, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            if expect_json:
+                return r.json()
+            return r.text
+        except Exception as e:
+            last_err = e
+            log(f"[WARN] request failed (attempt {attempt}/{RETRY_TIMES}): {e}")
+            if attempt < RETRY_TIMES:
+                time.sleep(RETRY_SLEEP_SEC)
+    raise last_err  # type: ignore
 
 def _extract_table_html(js_text: str) -> str:
     """
@@ -80,10 +140,12 @@ def _extract_table_html(js_text: str) -> str:
         t = re.search(r"<table[\s\S]*?</table>", s, re.I)
         if t:
             return t.group(0)
+
     # 兜底：响应本身已是 HTML
     t2 = re.search(r"<table[\s\S]*?</table>", js_text, re.I)
     if t2:
         return t2.group(0)
+
     raise RuntimeError("Failed to locate <table> HTML in response")
 
 def _find_header_row(df: pd.DataFrame) -> int:
@@ -98,194 +160,53 @@ def _find_header_row(df: pd.DataFrame) -> int:
             return i
     return -1
 
-def _pick_idx(columns: List[str], keys: List[str], default: Optional[int]=None) -> Optional[int]:
+def _pick_idx(columns: List[str], keys: List[str], default: Optional[int] = None) -> Optional[int]:
     for k in keys:
         for i, c in enumerate(columns):
             if k in str(c):
                 return i
     return default
 
-def _to_num(s: pd.Series) -> pd.Series:
+def _to_num_allow_minus(s: pd.Series) -> pd.Series:
     """
-    数值清洗：去千分位逗号，剔除非数字/小数点字符（处理 '-', '—', '1.234*' 等）
+    数值清洗：去千分位逗号，保留负号与小数点（处理 '-', '—', '1.234*' 等）
     """
     return pd.to_numeric(
         s.astype(str)
          .str.replace(",", "", regex=False)
-         .str.replace(r"[^0-9.]", "", regex=True),
+         .str.replace(r"[^0-9.\-]", "", regex=True),
         errors="coerce"
     )
 
-def _read_one_page(code: str, page: int) -> pd.DataFrame:
-    """
-    读取单页，强制无表头（header=None），在表内定位真正表头行然后标准化为两列：Date, Price
-    仅做结构化，不做去重/排序。
-    """
-    url = API_TMPL_PAGE.format(code=code, page=page)
-    log(f"[REQ] {code} page {page} -> {url}")
-    r = requests.get(url, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    table_html = _extract_table_html(r.text)
+# ------------------------ Fetchers ------------------------
 
-    # 关键：强制无表头读取，避免“首行数据被当表头”
+def fetch_nav_one_page(code: str) -> pd.DataFrame:
+    """
+    OTC 场外基金：抓取历史净值（单位净值优先，缺失回退累计净值）
+    当前默认抓第一页（最近的 50 条），并按日期升序返回 Date, Price。
+    """
+    url = API_TMPL_PAGE_NAV.format(code=code, page=1)
+    log(f"[REQ] NAV {code} -> {url}")
+    text = request_with_retry(requests.get, url, headers=HEADERS, timeout=25, expect_json=False)
+
+    table_html = _extract_table_html(text)
     tables = pd.read_html(io.StringIO(table_html), flavor="lxml", header=None)
     if not tables:
         raise RuntimeError("pandas.read_html found no table")
     raw = tables[0].copy()
 
-    # 去全空列/行
-    raw = raw.dropna(how="all", axis=1)
-    raw = raw.dropna(how="all", axis=0).reset_index(drop=True)
-
-    if raw.empty:
-        return pd.DataFrame(columns=["Date", "Price"])
-
-    # 寻找真正的表头行
-    hdr = _find_header_row(raw)
-    if hdr >= 0:
-        raw.columns = raw.iloc[hdr].astype(str).tolist()
-        df = raw.iloc[hdr+1:].reset_index(drop=True)
-    else:
-        # 找不到表头行：如果首列像日期，则用模板列名；否则退而求其次用第一行做表头
-        cols_template = ["净值日期","单位净值","累计净值","日增长率","申购状态","赎回状态","分红送配"]
-        first_val = str(raw.iloc[0, 0])
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", first_val):
-            df = raw.copy()
-            df.columns = cols_template[: df.shape[1]]
-        else:
-            df = raw.copy()
-            df.columns = df.iloc[0].astype(str).tolist()
-            df = df.iloc[1:].reset_index(drop=True)
-
-    # 选择列（名称优先，失败再兜底数值列）
-    cols = list(map(str, df.columns))
-    date_idx = _pick_idx(cols, ["净值日期", "日期"], default=0)
-    unit_idx = _pick_idx(cols, ["单位净值", "单位净值(元)", "单位"])
-    accu_idx = _pick_idx(cols, ["累计净值", "累计净值(元)", "累计"])
-
-    if date_idx is None:
-        # 无日期列则直接返回空
-        return pd.DataFrame(columns=["Date", "Price"])
-
-    # 行级回退：优先单位净值；若为空则用累计净值；再不行尝试首个数值列
-    date_ser = pd.to_datetime(df.iloc[:, date_idx], errors="coerce").dt.strftime("%Y-%m-%d")
-    unit_ser = _to_num(df.iloc[:, unit_idx]) if unit_idx is not None else None
-    accu_ser = _to_num(df.iloc[:, accu_idx]) if accu_idx is not None else None
-
-    if unit_ser is not None and accu_ser is not None:
-        price = unit_ser.combine_first(accu_ser)
-    elif unit_ser is not None:
-        price = unit_ser
-    elif accu_ser is not None:
-        price = accu_ser
-    else:
-        # 兜底：从第2列起找首个更像数值的列
-        best_i, best_cnt = None, -1
-        for i in range(1, df.shape[1]):
-            s = _to_num(df.iloc[:, i])
-            c = s.notna().sum()
-            if c > best_cnt:
-                best_i, best_cnt = i, c
-        if best_i is None:
-            return pd.DataFrame(columns=["Date", "Price"])
-        price = _to_num(df.iloc[:, best_i])
-
-    out = pd.DataFrame({"Date": date_ser, "Price": price})
-    out = out.dropna(subset=["Date", "Price"])
-    return out
-
-def _probe_total_pages(code: str) -> int:
-    """
-    探测总页数；若未能解析则返回 1。
-    """
-    url = API_TMPL_PROBE.format(code=code)
-    log(f"[PROBE] {code} -> {url}")
-    r = requests.get(url, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    text = r.text
-    m_pages = re.search(r'pages\s*:\s*(\d+)', text)
-    pages = int(m_pages.group(1)) if m_pages else 1
-    if MAX_PAGES is not None:
-        pages = min(pages, MAX_PAGES)
-    log(f"[INFO] {code}: total pages = {pages}")
-    return max(1, pages)
-
-# ------------------------ Core fetch (with retry) ------------------------
-
-def fetch_one(code: str) -> pd.DataFrame:
-    """
-    只抓第 1 页；修正表头误判/乱码；单位净值缺失时回退累计净值。
-    返回列：Date, Price（升序）。
-    """
-    import io, re, html, pandas as pd, requests
-
-    def _extract_table_html(js_text: str) -> str:
-        m = re.search(r'content\s*[:=]\s*"(.+?)"\s*,\s*(records|pages|curpage)', js_text, re.S)
-        if m:
-            raw = m.group(1)
-            s = (raw.replace(r'\"','"')
-                   .replace(r"\/","/")
-                   .replace(r"\n","").replace(r"\r","").replace(r"\t",""))
-            try:
-                s = s.encode("utf-8").decode("unicode_escape", errors="ignore")
-            except Exception:
-                pass
-            s = html.unescape(s)
-            t = re.search(r"<table[\s\S]*?</table>", s, re.I)
-            if t: return t.group(0)
-        t2 = re.search(r"<table[\s\S]*?</table>", js_text, re.I)
-        if t2: return t2.group(0)
-        raise RuntimeError("no <table> in response")
-
-    def _find_header_row(df: pd.DataFrame) -> int:
-        keys = ("净值日期", "单位净值", "累计净值", "日增长率")
-        for i in range(min(6, len(df))):
-            row_text = "".join(map(str, df.iloc[i].tolist()))
-            if any(k in row_text for k in keys):
-                return i
-        return -1
-
-    def _pick_idx(columns, keys, default=None):
-        for k in keys:
-            for i, c in enumerate(columns):
-                if k in str(c):
-                    return i
-        return default
-
-    def _to_num(s: pd.Series) -> pd.Series:
-        return pd.to_numeric(
-            s.astype(str)
-             .str.replace(",", "", regex=False)
-             .str.replace(r"[^0-9.]", "", regex=True),
-            errors="coerce"
-        )
-
-    # —— 仅第 1 页（per 放大以覆盖更多近期记录） ——
-    url = API_TMPL_PAGE.format(code=code, page=1)
-    log(f"[REQ] {code} -> {url}")
-    r = requests.get(url, headers=HEADERS, timeout=25); r.raise_for_status()
-    table_html = _extract_table_html(r.text)
-
-    # 强制无表头读取，防“首行数据当表头”
-    tables = pd.read_html(io.StringIO(table_html), flavor="lxml", header=None)
-    if not tables:
-        raise RuntimeError("pandas.read_html found no table")
-    raw = tables[0].copy()
-
-    # 去空列/空行
     raw = raw.dropna(how="all", axis=1)
     raw = raw.dropna(how="all", axis=0).reset_index(drop=True)
     if raw.empty:
         raise RuntimeError("empty table")
 
-    # 在表内定位真实表头
     hdr = _find_header_row(raw)
     if hdr >= 0:
         raw.columns = raw.iloc[hdr].astype(str).tolist()
-        df = raw.iloc[hdr+1:].reset_index(drop=True)
+        df = raw.iloc[hdr + 1:].reset_index(drop=True)
     else:
-        cols_template = ["净值日期","单位净值","累计净值","日增长率","申购状态","赎回状态","分红送配"]
-        first_val = str(raw.iloc[0,0])
+        cols_template = ["净值日期", "单位净值", "累计净值", "日增长率", "申购状态", "赎回状态", "分红送配"]
+        first_val = str(raw.iloc[0, 0])
         if re.match(r"^\d{4}-\d{2}-\d{2}$", first_val):
             df = raw.copy()
             df.columns = cols_template[: df.shape[1]]
@@ -303,10 +224,9 @@ def fetch_one(code: str) -> pd.DataFrame:
         raise RuntimeError(f"no date column, headers={cols}")
 
     date_ser = pd.to_datetime(df.iloc[:, date_idx], errors="coerce").dt.strftime("%Y-%m-%d")
-    unit_ser = _to_num(df.iloc[:, unit_idx]) if unit_idx is not None else None
-    accu_ser = _to_num(df.iloc[:, accu_idx]) if accu_idx is not None else None
+    unit_ser = _to_num_allow_minus(df.iloc[:, unit_idx]) if unit_idx is not None else None
+    accu_ser = _to_num_allow_minus(df.iloc[:, accu_idx]) if accu_idx is not None else None
 
-    # 行级回退：单位净值缺 -> 用累计净值
     if unit_ser is not None and accu_ser is not None:
         price = unit_ser.combine_first(accu_ser)
     elif unit_ser is not None:
@@ -316,41 +236,78 @@ def fetch_one(code: str) -> pd.DataFrame:
     else:
         raise RuntimeError(f"no NAV columns, headers={cols}")
 
-    out = (pd.DataFrame({"Date": date_ser, "Price": price})
-           .dropna(subset=["Date","Price"])
-           .drop_duplicates()
-           .sort_values("Date")
-           .reset_index(drop=True))
-
+    out = (
+        pd.DataFrame({"Date": date_ser, "Price": price})
+        .dropna(subset=["Date", "Price"])
+        .drop_duplicates(subset=["Date"])
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
     if out.empty:
-        raise RuntimeError("parsed empty after fixes")
+        raise RuntimeError("parsed empty NAV after cleaning")
+    return out
+
+def fetch_lof_close(secid: str, stem: str) -> pd.DataFrame:
+    """
+    LOF 场内：抓取历史日K收盘价（Close），返回 Date, Price（升序）
+    secid: "1.xxxxxx"(沪) / "0.xxxxxx"(深)
+    """
+    params = dict(KLINE_BASE_PARAMS)
+    params["secid"] = secid
+
+    headers = {**HEADERS, "Referer": "https://quote.eastmoney.com/"}
+    log(f"[REQ] LOF {stem} (secid={secid}) -> {KLINE_URL}")
+    j = request_with_retry(requests.get, KLINE_URL, params=params, headers=headers, timeout=25, expect_json=True)
+
+    data = (j or {}).get("data") or {}
+    klines = data.get("klines") or []
+    if not klines:
+        raise RuntimeError("no kline data (empty klines)")
+
+    rows = [k.split(",") for k in klines]
+    df = pd.DataFrame(rows, columns=["Date", "Open", "Close", "High", "Low", "Vol", "Amt"])
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["Price"] = pd.to_numeric(df["Close"], errors="coerce")
+
+    out = (
+        df.dropna(subset=["Date", "Price"])[["Date", "Price"]]
+        .drop_duplicates(subset=["Date"])
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
+    if out.empty:
+        raise RuntimeError("parsed empty LOF kline after cleaning")
     return out
 
 # ------------------------ Writers ------------------------
 
-def write_csv(df: pd.DataFrame, code: str) -> Path:
-    p = DATA_DIR / f"{code}.csv"
+def write_csv(df: pd.DataFrame, stem: str) -> Path:
+    p = DATA_DIR / f"{stem}.csv"
     df.to_csv(p, index=False)
     log(f"[OUT] CSV  -> {p}")
     return p
 
-def write_html_table(df: pd.DataFrame, code: str) -> Path:
-    # PP 对两列英文字段名最稳：Date / Close；尽量简洁，首元素即表格
+def write_html_table(df: pd.DataFrame, stem: str) -> Path:
     out = df.rename(columns={"Price": "Close"})[["Date", "Close"]].copy()
     table_html = out.to_html(index=False, border=1)
     html_page = f"""<!doctype html>
 <meta charset="utf-8">
 {table_html}
 """
-    p = SITE_DIR / f"{code}.html"
+    p = SITE_DIR / f"{stem}.html"
     p.write_text(html_page, encoding="utf-8")
     log(f"[OUT] HTML -> {p}")
     return p
 
-def write_json(df: pd.DataFrame, code: str) -> Path:
-    payload = [{"date": d, "close": float(p)} for d, p in df[["Date", "Price"]].itertuples(index=False, name=None)]
-    p = SITE_DIR / f"{code}.json"
-    p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+def write_json(df: pd.DataFrame, stem: str) -> Path:
+    clean = df[["Date", "Price"]].copy()
+    clean["Price"] = pd.to_numeric(clean["Price"], errors="coerce")
+    clean = clean.dropna(subset=["Date", "Price"])
+    clean = clean[np.isfinite(clean["Price"].to_numpy())]
+
+    payload = [{"date": d, "close": float(p)} for d, p in clean.itertuples(index=False, name=None)]
+    p = SITE_DIR / f"{stem}.json"
+    p.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False), encoding="utf-8")
     log(f"[OUT] JSON -> {p}")
     return p
 
@@ -365,27 +322,36 @@ def main() -> None:
     conf = json.loads(cfg_path.read_text(encoding="utf-8"))
     codes: List[str] = conf.get("codes", [])
     if not codes:
-        log("[ERR] No fund codes found in data/funds.json")
+        log("[ERR] No codes found in data/funds.json")
         sys.exit(1)
 
     total_rows = 0
     ok_cnt = 0
     fail_cnt = 0
 
-    for idx, code in enumerate(codes, 1):
-        log(f"[START] ({idx}/{len(codes)}) {code}")
+    for idx, sym in enumerate(codes, 1):
+        log(f"[START] ({idx}/{len(codes)}) {sym}")
         try:
-            df = fetch_one(code)
-            log(f"[INFO] {code}: {len(df)} rows")
-            write_csv(df, code)
-            write_html_table(df, code)
-            write_json(df, code)
+            info = parse_symbol(sym)
+            stem = info["stem"]
+
+            if info["kind"] == "nav":
+                df = fetch_nav_one_page(info["code"])
+            else:
+                df = fetch_lof_close(info["secid"], stem)
+
+            log(f"[INFO] {sym} -> {stem}: {len(df)} rows")
+            write_csv(df, stem)
+            write_html_table(df, stem)
+            write_json(df, stem)
+
             total_rows += len(df)
             ok_cnt += 1
-            log(f"[DONE] {code}")
+            log(f"[DONE] {sym}")
         except Exception as e:
             fail_cnt += 1
-            log(f"[FAIL] {code}: {e}")
+            log(f"[FAIL] {sym}: {e}")
+
         time.sleep(BETWEEN_FUNDS_SLEEP)
 
     if ok_cnt == 0:
