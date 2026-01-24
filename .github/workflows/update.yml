@@ -5,6 +5,7 @@ on:
   schedule:
     # 每个工作日 12:30 UTC 运行一次（可按需调整）
     - cron: "30 17 * * *"
+
 permissions:
   contents: write
   pages: write
@@ -29,6 +30,18 @@ jobs:
       - name: Run fetch
         run: python fetch_eastmoney.py
 
+      - name: List site dir
+        run: |
+          echo "==== site/ ===="
+          ls -lh site || true
+
+      - name: Check site not empty
+        run: |
+          if [ -z "$(ls -A site 2>/dev/null)" ]; then
+            echo "site/ is empty, aborting deploy"
+            exit 1
+          fi
+
       - name: Commit artifacts
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
@@ -38,8 +51,7 @@ jobs:
             data/*.csv
             site/*.html
             site/*.json
-            
-            # 将 site/ 目录发布到 gh-pages 作为 GitHub Pages（静态 HTML 表格）
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
