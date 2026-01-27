@@ -72,9 +72,9 @@ HEADERS = {
     )
 }
 
-RETRY_TIMES = 3          # 每只标的最多重试次数
-RETRY_SLEEP_SEC = 3      # 失败后的等待
-BETWEEN_FUNDS_SLEEP = 2  # 相邻标的之间等待，降低限流
+RETRY_TIMES = 8          # 每只标的最多重试次数
+RETRY_SLEEP_SEC = 2.6      # 失败后的等待
+BETWEEN_FUNDS_SLEEP = 4.8  # 相邻标的之间等待，降低限流
 
 # ------------------------ Utilities ------------------------
 
@@ -107,21 +107,33 @@ def parse_symbol(sym: str) -> Dict[str, Any]:
     raise ValueError(f"invalid symbol: {sym}")
 
 def request_with_retry(method, url: str, *, params=None, headers=None, timeout=25, expect_json=False) -> Any:
+    import random
+
     last_err = None
     for attempt in range(1, RETRY_TIMES + 1):
         try:
-            r = method(url, params=params, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            if expect_json:
-                return r.json()
-            return r.text
+            # 每次重试强制新连接：新 Session + Connection: close
+            h = dict(headers or {})
+            h.setdefault("Connection", "close")
+
+            with requests.Session() as s:
+                r = s.request("GET", url, params=params, headers=h, timeout=timeout)
+                r.raise_for_status()
+                if expect_json:
+                    return r.json()
+                return r.text
+
         except Exception as e:
             last_err = e
             log(f"[WARN] request failed (attempt {attempt}/{RETRY_TIMES}): {e}")
-            if attempt < RETRY_TIMES:
-                time.sleep(RETRY_SLEEP_SEC)
-    raise last_err  # type: ignore
 
+            if attempt < RETRY_TIMES:
+                # 指数退避 + 抖动（更容易下一次走到不同后端）
+                sleep = min(25, (2 ** (attempt - 1)) * 0.7 + random.uniform(0.2, 1.8))
+                time.sleep(sleep)
+
+    raise last_err  # type: ignore
+   
 def _extract_table_html(js_text: str) -> str:
     """
     从 Eastmoney 的响应中提取第一张 <table>…</table>
