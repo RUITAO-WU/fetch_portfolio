@@ -42,13 +42,11 @@ SITE_DIR = ROOT / "site"
 DATA_DIR.mkdir(exist_ok=True)
 SITE_DIR.mkdir(exist_ok=True)
 
-# -------- LOF recent window --------
-LOF_DAYS = 35   # 只抓最近约 1 个月（含缓冲）
-
 # --- OTC Fund NAV (历史净值) ---
+NAV_PER_PAGE = 200  # 每页条数（东方财富支持最大 200）
 API_TMPL_PAGE_NAV = (
     "https://fund.eastmoney.com/f10/F10DataApi.aspx"
-    "?type=lsjz&code={code}&page={page}&per=50&sdate=2000-01-01&edate=2099-12-31"
+    f"?type=lsjz&code={{code}}&page={{page}}&per={NAV_PER_PAGE}&sdate=2000-01-01&edate=2099-12-31"
 )
 
 # --- LOF Close (历史K线) ---
@@ -195,15 +193,8 @@ def _to_num_allow_minus(s: pd.Series) -> pd.Series:
 
 # ------------------------ Fetchers ------------------------
 
-def fetch_nav_one_page(code: str) -> pd.DataFrame:
-    """
-    OTC 场外基金：抓取历史净值（单位净值优先，缺失回退累计净值）
-    当前默认抓第一页（最近的 50 条），并按日期升序返回 Date, Price。
-    """
-    url = API_TMPL_PAGE_NAV.format(code=code, page=1)
-    log(f"[REQ] NAV {code} -> {url}")
-    text = request_with_retry(requests.get, url, headers=HEADERS, timeout=25, expect_json=False)
-
+def _parse_nav_page(text: str) -> pd.DataFrame:
+    """从单页 API 响应中解析出 Date, Price 两列（内部辅助函数）。"""
     table_html = _extract_table_html(text)
     tables = pd.read_html(io.StringIO(table_html), flavor="lxml", header=None)
     if not tables:
@@ -251,8 +242,45 @@ def fetch_nav_one_page(code: str) -> pd.DataFrame:
     else:
         raise RuntimeError(f"no NAV columns, headers={cols}")
 
+    return pd.DataFrame({"Date": date_ser, "Price": price})
+
+
+def _extract_total_pages(js_text: str) -> int:
+    """从 API 响应中提取总页数（提取 pages 字段，或根据 records 计算）。"""
+    m = re.search(r'\bpages\s*[:=]\s*(\d+)', js_text)
+    if m:
+        return max(1, int(m.group(1)))
+    m = re.search(r'\brecords\s*[:=]\s*(\d+)', js_text)
+    if m:
+        total = int(m.group(1))
+        return max(1, (total + NAV_PER_PAGE - 1) // NAV_PER_PAGE)
+    return 1
+
+
+def fetch_nav_all_pages(code: str) -> pd.DataFrame:
+    """
+    OTC 场外基金：分页抓取全部历史净值（单位净值优先，缺失回退累计净值）。
+    返回按日期升序排列的 Date, Price。
+    """
+    # 先取第 1 页，同时获取总页数
+    url_p1 = API_TMPL_PAGE_NAV.format(code=code, page=1)
+    log(f"[REQ] NAV {code} page=1 -> {url_p1}")
+    text_p1 = request_with_retry(requests.get, url_p1, headers=HEADERS, timeout=25, expect_json=False)
+
+    total_pages = _extract_total_pages(text_p1)
+    log(f"[INFO] NAV {code}: total_pages={total_pages}")
+
+    all_dfs: List[pd.DataFrame] = [_parse_nav_page(text_p1)]
+
+    for page in range(2, total_pages + 1):
+        url = API_TMPL_PAGE_NAV.format(code=code, page=page)
+        log(f"[REQ] NAV {code} page={page}/{total_pages} -> {url}")
+        time.sleep(1.5)  # 翻页间隔，避免触发限流
+        text = request_with_retry(requests.get, url, headers=HEADERS, timeout=25, expect_json=False)
+        all_dfs.append(_parse_nav_page(text))
+
     out = (
-        pd.DataFrame({"Date": date_ser, "Price": price})
+        pd.concat(all_dfs, ignore_index=True)
         .dropna(subset=["Date", "Price"])
         .drop_duplicates(subset=["Date"])
         .sort_values("Date")
@@ -264,18 +292,12 @@ def fetch_nav_one_page(code: str) -> pd.DataFrame:
 
 def fetch_lof_close(secid: str, stem: str) -> pd.DataFrame:
     """
-    LOF 场内：抓取历史日K收盘价（Close），返回 Date, Price（升序）
+    LOF 场内：抓取全部历史日K收盘价（Close），返回 Date, Price（升序）
     secid: "1.xxxxxx"(沪) / "0.xxxxxx"(深)
     """
     params = dict(KLINE_BASE_PARAMS)
     params["secid"] = secid
-    
-    # ---- limit to recent ~1 month ----
-    end = pd.Timestamp.today().strftime("%Y%m%d")
-    beg = (pd.Timestamp.today() - pd.Timedelta(days=LOF_DAYS)).strftime("%Y%m%d")
-    params["beg"] = beg
-    params["end"] = end
-    params["lmt"] = "200"
+    # KLINE_BASE_PARAMS 已设置 beg=20000101 / lmt=100000，无需限制时间窗口
 
     headers = {**HEADERS, "Referer": "https://quote.eastmoney.com/"}
     log(f"[REQ] LOF {stem} (secid={secid}) -> {KLINE_URL}")
@@ -358,7 +380,7 @@ def main() -> None:
             stem = info["stem"]
 
             if info["kind"] == "nav":
-                df = fetch_nav_one_page(info["code"])
+                df = fetch_nav_all_pages(info["code"])
             else:
                 df = fetch_lof_close(info["secid"], stem)
 
