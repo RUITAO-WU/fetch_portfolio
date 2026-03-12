@@ -42,11 +42,16 @@ SITE_DIR = ROOT / "site"
 DATA_DIR.mkdir(exist_ok=True)
 SITE_DIR.mkdir(exist_ok=True)
 
+# 每次抓取最近多少天（约1个月+缓冲）
+FETCH_DAYS = 40
+# CSV/JSON 保留最近多少个月的数据
+KEEP_MONTHS = 3
+
 # --- OTC Fund NAV (历史净值) ---
-NAV_PER_PAGE = 200  # 每页条数（东方财富支持最大 200）
-API_TMPL_PAGE_NAV = (
+# sdate 动态传入，限制只取最近 FETCH_DAYS 天
+API_URL_NAV = (
     "https://fund.eastmoney.com/f10/F10DataApi.aspx"
-    f"?type=lsjz&code={{code}}&page={{page}}&per={NAV_PER_PAGE}&sdate=2000-01-01&edate=2099-12-31"
+    "?type=lsjz&code={code}&page=1&per=50&sdate={sdate}&edate=2099-12-31"
 )
 
 # --- LOF Close (历史K线) ---
@@ -54,9 +59,6 @@ KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 KLINE_BASE_PARAMS = {
     "klt": "101",  # 101=日线
     "fqt": "0",    # 0=不复权；1=前复权；2=后复权
-    "beg": "20000101",
-    "end": "20991231",
-    "lmt": "100000",
     "fields1": "f1,f2,f3,f4,f5,f6",
     # f51 日期, f52 开, f53 收, f54 高, f55 低, f56 量, f57 额
     "fields2": "f51,f52,f53,f54,f55,f56,f57",
@@ -245,42 +247,18 @@ def _parse_nav_page(text: str) -> pd.DataFrame:
     return pd.DataFrame({"Date": date_ser, "Price": price})
 
 
-def _extract_total_pages(js_text: str) -> int:
-    """从 API 响应中提取总页数（提取 pages 字段，或根据 records 计算）。"""
-    m = re.search(r'\bpages\s*[:=]\s*(\d+)', js_text)
-    if m:
-        return max(1, int(m.group(1)))
-    m = re.search(r'\brecords\s*[:=]\s*(\d+)', js_text)
-    if m:
-        total = int(m.group(1))
-        return max(1, (total + NAV_PER_PAGE - 1) // NAV_PER_PAGE)
-    return 1
-
-
-def fetch_nav_all_pages(code: str) -> pd.DataFrame:
+def fetch_nav_recent(code: str) -> pd.DataFrame:
     """
-    OTC 场外基金：分页抓取全部历史净值（单位净值优先，缺失回退累计净值）。
+    OTC 场外基金：抓取最近 FETCH_DAYS 天的净值（单位净值优先，缺失回退累计净值）。
     返回按日期升序排列的 Date, Price。
     """
-    # 先取第 1 页，同时获取总页数
-    url_p1 = API_TMPL_PAGE_NAV.format(code=code, page=1)
-    log(f"[REQ] NAV {code} page=1 -> {url_p1}")
-    text_p1 = request_with_retry(requests.get, url_p1, headers=HEADERS, timeout=25, expect_json=False)
-
-    total_pages = _extract_total_pages(text_p1)
-    log(f"[INFO] NAV {code}: total_pages={total_pages}")
-
-    all_dfs: List[pd.DataFrame] = [_parse_nav_page(text_p1)]
-
-    for page in range(2, total_pages + 1):
-        url = API_TMPL_PAGE_NAV.format(code=code, page=page)
-        log(f"[REQ] NAV {code} page={page}/{total_pages} -> {url}")
-        time.sleep(1.5)  # 翻页间隔，避免触发限流
-        text = request_with_retry(requests.get, url, headers=HEADERS, timeout=25, expect_json=False)
-        all_dfs.append(_parse_nav_page(text))
+    sdate = (pd.Timestamp.today() - pd.Timedelta(days=FETCH_DAYS)).strftime("%Y-%m-%d")
+    url = API_URL_NAV.format(code=code, sdate=sdate)
+    log(f"[REQ] NAV {code} -> {url}")
+    text = request_with_retry(requests.get, url, headers=HEADERS, timeout=25, expect_json=False)
 
     out = (
-        pd.concat(all_dfs, ignore_index=True)
+        _parse_nav_page(text)
         .dropna(subset=["Date", "Price"])
         .drop_duplicates(subset=["Date"])
         .sort_values("Date")
@@ -292,12 +270,14 @@ def fetch_nav_all_pages(code: str) -> pd.DataFrame:
 
 def fetch_lof_close(secid: str, stem: str) -> pd.DataFrame:
     """
-    LOF 场内：抓取全部历史日K收盘价（Close），返回 Date, Price（升序）
+    LOF 场内：抓取最近 FETCH_DAYS 天的日K收盘价（Close），返回 Date, Price（升序）
     secid: "1.xxxxxx"(沪) / "0.xxxxxx"(深)
     """
     params = dict(KLINE_BASE_PARAMS)
     params["secid"] = secid
-    # KLINE_BASE_PARAMS 已设置 beg=20000101 / lmt=100000，无需限制时间窗口
+    params["beg"] = (pd.Timestamp.today() - pd.Timedelta(days=FETCH_DAYS)).strftime("%Y%m%d")
+    params["end"] = pd.Timestamp.today().strftime("%Y%m%d")
+    params["lmt"] = "200"
 
     headers = {**HEADERS, "Referer": "https://quote.eastmoney.com/"}
     log(f"[REQ] LOF {stem} (secid={secid}) -> {KLINE_URL}")
@@ -322,6 +302,39 @@ def fetch_lof_close(secid: str, stem: str) -> pd.DataFrame:
     if out.empty:
         raise RuntimeError("parsed empty LOF kline after cleaning")
     return out
+
+# ------------------------ Merge & Trim ------------------------
+
+def merge_with_existing(new_df: pd.DataFrame, stem: str) -> pd.DataFrame:
+    """
+    读取已有 CSV，与本次新抓取的数据合并：
+    - 去重（以 Date 为 key，新数据优先）
+    - 只保留最近 KEEP_MONTHS 个月
+    - 按日期升序返回
+    """
+    csv_path = DATA_DIR / f"{stem}.csv"
+    if csv_path.exists():
+        try:
+            existing = pd.read_csv(csv_path, dtype={"Date": str, "Price": float})
+            combined = pd.concat([existing, new_df], ignore_index=True)
+        except Exception as e:
+            log(f"[WARN] could not read existing CSV for {stem}, using new data only: {e}")
+            combined = new_df
+    else:
+        combined = new_df
+
+    cutoff = (pd.Timestamp.today() - pd.DateOffset(months=KEEP_MONTHS)).strftime("%Y-%m-%d")
+    merged = (
+        combined
+        .dropna(subset=["Date", "Price"])
+        # 去重时保留最后一条（即新数据），所以先按 Date 排序再 drop_duplicates keep=last
+        .sort_values("Date")
+        .drop_duplicates(subset=["Date"], keep="last")
+        .query("Date >= @cutoff")
+        .reset_index(drop=True)
+    )
+    log(f"[MERGE] {stem}: {len(new_df)} new + existing -> {len(merged)} rows (cutoff={cutoff})")
+    return merged
 
 # ------------------------ Writers ------------------------
 
@@ -380,11 +393,12 @@ def main() -> None:
             stem = info["stem"]
 
             if info["kind"] == "nav":
-                df = fetch_nav_all_pages(info["code"])
+                df = fetch_nav_recent(info["code"])
             else:
                 df = fetch_lof_close(info["secid"], stem)
 
-            log(f"[INFO] {sym} -> {stem}: {len(df)} rows")
+            log(f"[INFO] {sym} -> {stem}: {len(df)} new rows")
+            df = merge_with_existing(df, stem)
             write_csv(df, stem)
             write_html_table(df, stem)
             write_json(df, stem)
