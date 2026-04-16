@@ -1,3 +1,3 @@
-# fetch_portfolio
+# site_portfolio
 
-Portfolio data site hosted via GitHub Pages.
+Static site hosted via GitHub Pages.
